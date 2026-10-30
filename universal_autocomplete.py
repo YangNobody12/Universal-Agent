@@ -1102,6 +1102,137 @@ def request_spellcheck(cfg: dict, segment: str) -> str:
     return chat(cfg, SPELLCHECK_SYSTEM, segment, max(16, len(segment) * 3), 0)
 
 
+# ---- Word-level spellcheck: the model names misspelled words instead of rewriting the line, and every
+# proposed fix is double-checked, so correct words, slang and spacing are left alone.
+
+SPELLFIX_SYSTEM = """You find genuine SPELLING MISTAKES (typos) in Thai or English text someone is typing.
+Reply with JSON only: {"fixes": [{"wrong": "<exact misspelled word as written>", "right": "<correct spelling>"}]}
+Report a word ONLY if it is clearly misspelled: missing/extra/wrong letters, wrong vowel or tone mark.
+Never report: correct words; informal or slang spellings and particles people use on purpose (วะ, ว่ะ, เว้ย, คับ,
+ค่ะ/คะ, จ้า, นะ, มั้ย, ป่ะ, เด้อ, 555, lol, u, gonna); names, brands, code, URLs; spacing, punctuation or grammar
+choices; words that are only unfinished at the very end. "wrong" must be copied exactly from the text.
+If nothing is misspelled reply {"fixes": []}.
+Examples:
+วันนี้กาทำงานเสร็จเร็ว -> {"fixes": [{"wrong": "กาทำงาน", "right": "การทำงาน"}]}
+ผมไปโรงเรีนทุกวัน -> {"fixes": [{"wrong": "โรงเรีน", "right": "โรงเรียน"}]}
+วันนี้อากาสดีมาก -> {"fixes": [{"wrong": "อากาส", "right": "อากาศ"}]}
+I recieve the pakage -> {"fixes": [{"wrong": "recieve", "right": "receive"}, {"wrong": "pakage", "right": "package"}]}
+ถ้าเว้นวะก็ไม่เป็น -> {"fixes": []}
+เช็กระบบแก้ไขข้อ ที่ -> {"fixes": []}
+ประชุมพรุ่งนี้กี่โมงคับ -> {"fixes": []}"""
+
+SPELLFIX_VERIFY = """Text: {text}
+Proposed spelling fix: "{wrong}" -> "{right}"
+Answer YES only if "{wrong}" is clearly a typo/misspelling and "{right}" is what the writer meant, with the
+same meaning. Answer NO if "{wrong}" is already a correct word here, an intentional informal/slang spelling,
+a name, or if the change alters the meaning or only changes spacing. Reply with exactly YES or NO."""
+
+_thai_tokenize = None
+_thai_words = None
+
+
+def thai_dictionary():
+    """pythainlp's Thai word list (~62k words) as a set, or None when pythainlp isn't installed."""
+    global _thai_words
+    if _thai_words is None:
+        try:
+            from pythainlp.corpus import thai_words
+
+            _thai_words = set(thai_words())
+        except Exception:
+            _thai_words = set()
+    return _thai_words or None
+
+
+def clear_thai_misspelling(wrong: str, right: str) -> bool:
+    """A Thai 'wrong' that isn't a dictionary word fixed into one that is (กาทำงาน -> การทำงาน): certain
+    enough to skip the model's second opinion, which tends to rationalise such typos as intended."""
+    words = thai_dictionary()
+    return bool(words) and any("฀" <= c <= "๿" for c in wrong) \
+        and wrong not in words and right in words
+
+
+def _tokenize(text: str) -> list:
+    """Word tokens (whitespace kept). Thai has no spaces between words, so pythainlp's dictionary tokenizer
+    is used when installed; otherwise whitespace splitting."""
+    global _thai_tokenize
+    if _thai_tokenize is None:
+        try:
+            from pythainlp.tokenize import word_tokenize
+
+            _thai_tokenize = lambda s: word_tokenize(s, engine="newmm", keep_whitespace=True)  # noqa: E731
+        except Exception:
+            import re
+
+            _thai_tokenize = lambda s: re.findall(r"\s+|\S+", s)  # noqa: E731
+    return _thai_tokenize(text)
+
+
+def checkable_part(segment: str) -> str:
+    """The segment minus a possibly unfinished last word: only text the user has clearly finished typing
+    gets checked, so "การทำง" (still typing) is never "fixed" into a different word."""
+    if not segment or segment[-1].isspace() or segment[-1] in ".,!?;:)]}\"'…ๆฯ":
+        return segment
+    tokens = _tokenize(segment)
+    return segment[: len(segment) - len(tokens[-1])] if tokens else ""
+
+
+def _parse_fixes(reply: str) -> list:
+    import re
+
+    m = re.search(r"\{.*\}", reply, re.S)
+    if not m:
+        return []
+    try:
+        fixes = json.loads(m.group(0)).get("fixes", [])
+    except Exception:
+        return []
+    return [(str(f.get("wrong", "")), str(f.get("right", ""))) for f in fixes if isinstance(f, dict)]
+
+
+def _plausible_fix(text: str, wrong: str, right: str) -> bool:
+    import difflib
+
+    if not wrong.strip() or not right.strip() or wrong == right or wrong not in text or len(wrong) > 40:
+        return False
+    if "".join(wrong.split()) == "".join(right.split()):
+        return False  # only spacing changed
+    # A typo fix keeps most of the word; anything else is the model rewriting or swapping words
+    return difflib.SequenceMatcher(None, wrong, right).ratio() >= 0.5
+
+
+def request_spelling_fix(cfg: dict, segment: str):
+    """Asks the model which words in the finished part of `segment` are misspelled, confirms each one,
+    and returns (backspaces, retype, wrong, right) like find_spelling_fix, or None."""
+    text = checkable_part(segment)
+    if len(text.strip()) < 3:
+        return None
+    reply = chat(cfg, SPELLFIX_SYSTEM, text, max(48, len(text) * 4), 0)
+    candidates = [(w, r) for w, r in _parse_fixes(reply) if _plausible_fix(text, w, r)]
+    confirmed = []
+    for wrong, right in candidates[:3]:
+        if clear_thai_misspelling(wrong, right):
+            confirmed.append((wrong, right))
+            continue
+        # Real words (ก็, วะ, คับ ...) or English: only change them if a second look agrees it's a typo
+        verdict = chat(cfg, "You are a careful Thai and English proofreader.",
+                       SPELLFIX_VERIFY.format(text=text.strip(), wrong=wrong, right=right), 4, 0)
+        if verdict.strip().upper().startswith("YES"):
+            confirmed.append((wrong, right))
+    if not confirmed:
+        return None
+
+    # Apply the fixes to the last occurrence of each word inside the finished part
+    corrected, start = segment, len(segment)
+    for wrong, right in sorted(confirmed, key=lambda p: text.rfind(p[0]), reverse=True):
+        i = text.rfind(wrong)
+        corrected = corrected[:i] + right + corrected[i + len(wrong):]
+        start = min(start, i)
+    shown = sorted(confirmed, key=lambda p: text.rfind(p[0]))
+    return (len(segment) - start, corrected[start:],
+            ", ".join(w for w, _ in shown), ", ".join(r for _, r in shown))
+
+
 def request_completion(cfg: dict, context_text: str, is_code: bool, max_tokens: int) -> dict:
     """Returns {"completion": str, "stats": str}. Raises on network/API errors."""
     msgs = build_chat_messages(context_text[-2000:], is_code)
@@ -1883,13 +2014,13 @@ class UniversalAutocompleteApp:
                 seg = spellcheck_segment(context_text)
                 if len(seg.strip()) < 3:
                     return
-                corrected = self._spell_cache.get(seg)
-                if corrected is None:
-                    corrected = request_spellcheck(self.config, seg)
+                if seg in self._spell_cache:
+                    fix = self._spell_cache[seg]
+                else:
+                    fix = request_spelling_fix(self.config, seg)
                     if len(self._spell_cache) > 200:
                         self._spell_cache.clear()
-                    self._spell_cache[seg] = corrected
-                fix = find_spelling_fix(seg, corrected)
+                    self._spell_cache[seg] = fix
                 if fix is None or my_seq != self.req_seq:
                     return
                 backspaces, retype, wrong, right = fix

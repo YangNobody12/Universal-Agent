@@ -11,5 +11,8 @@ openai>=3.0        # OpenAI-compatible: Typhoon, OpenAI, Gemini, OpenRouter, Gro
 anthropic>=2.0     # Anthropic Claude
 ollama>=0.5        # Ollama (native API; 0.5+ can switch off thinking)
 
+# Thai word segmentation + dictionary for the spell checker (without it: whitespace splitting, fewer Thai fixes)
+pythainlp>=5.0
+
 # Tests (optional): pytest, or plain `python test_universal_autocomplete.py`
 pytest>=7.0
