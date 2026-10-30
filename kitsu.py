@@ -23,5 +23,8 @@ if __name__ == "__main__":
             sys.exit(0)
         print("[admin] elevation declined; running without admin rights")
     app = ua.UniversalAutocompleteApp(cfg)
-    npc_companion.attach(app)
-    app.run()
+    npc = npc_companion.attach(app)
+    try:
+        app.run()
+    finally:
+        npc.shutdown()  # close the Flet chat window process too

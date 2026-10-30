@@ -11,16 +11,23 @@ keys are handled locally and never sent to the AI.
 Sprites: assets/npc/*.png, drawn by make_character.py.
 """
 
+import ctypes
+import importlib.util
 import json
 import math
 import os
 import queue
 import random
 import re
+import secrets
+import socket
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 
+import harness as harness_mod
 import universal_autocomplete as ua
 
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "npc")
@@ -51,7 +58,10 @@ PERSONA = (
     "suggestion (you run over and write it), Esc dismisses, Alt+\\ asks for a suggestion now, Ctrl+Shift+Q turns "
     "autocomplete on/off. It also spots misspelled words and Tab fixes them. To change AI provider the user can "
     "say e.g. 'use ollama' / 'เปลี่ยนเป็น typhoon'. To set an API key they just paste it into this chat and you "
-    "save it locally. Never ask the user to send a key anywhere else. Current provider: {provider}."
+    "save it locally. Never ask the user to send a key anywhere else. You can also hand coding tasks to AI agents "
+    "installed on the PC: '/claude <task>', '/codex <task>', '/opencode <task>' (read-only), add '+' to let the agent "
+    "edit files (e.g. '/claude+ fix the bug'), '/cd <folder>' sets their working folder, '/stop' stops, '/harness' "
+    "lists them. Current provider: {provider}."
 )
 
 # Recognisable key formats -> provider. Plain "sk-..." is shared by several providers, so we ask.
@@ -69,9 +79,221 @@ SWITCH_RE = re.compile(r"(?:ใช้|เปลี่ยน(?:เป็น|ไ�
                        re.I)
 AMBIGUOUS_SK = ["typhoon", "openai", "deepseek", "mistral", "together", "custom"]
 
+# Coding agents: "/claude task" (read-only), "/claude+ task" (may edit files), or "ให้ claude task"
+HARNESS_CMD_RE = re.compile(r"^/(claude|codex|opencode)(\+)?\s+(.+)$", re.I | re.S)
+HARNESS_NL_RE = re.compile(r"^(?:ให้|ถาม|สั่ง|ask)\s*(claude|codex|opencode)\s*(?:ช่วย)?\s*(.+)$", re.I | re.S)
+HARNESS_SHOWN_LINES = 40  # progress lines echoed into the chat per run
+
 
 PRIVATE_HWNDS = set()  # Kitsu's chat window: the autocomplete hook must not read what's typed there
 PRIVATE_APP = "kitsu-chat"
+FLET_APP = "flet.exe"  # process of Kitsu's Flet windows (kitsu_chat_ui.py, kitsu_settings_ui.py)
+
+
+def normalize_title(title: str) -> str:
+    return title.strip()
+
+
+class FletChat:
+    """A Kitsu window drawn with Flet in a child process (kitsu_chat_ui.py, kitsu_settings_ui.py). All logic
+    stays in Kitsu; this just ships JSON lines over a localhost socket guarded by a one-time token. Messages
+    from the window arrive on `events` as (channel, msg); (channel + "_failed", reason) if it never comes up."""
+
+    def __init__(self, events: queue.Queue, script: str = "kitsu_chat_ui.py", channel: str = "ui",
+                 title: str = "Kitsu Chat"):
+        self.events = events
+        self.channel, self.title = channel, title
+        self.visible = False
+        self.text = ""          # what's in the window's input box (mirrored from "typed")
+        self.size = (460, 640)
+        self.conn = None
+        self.lock = threading.Lock()
+        self.token = secrets.token_hex(16)
+        self.prev_foreground = ua.user32.GetForegroundWindow()  # the starting window grabs focus; give it back
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), script)
+        log_dir = os.environ.get("KITSU_UI_LOG")  # set to a folder to capture the windows' output for debugging
+        out = open(os.path.join(log_dir, f"{channel}.log"), "w", encoding="utf-8") if log_dir else subprocess.DEVNULL
+        self.proc = subprocess.Popen([sys.executable, script, str(srv.getsockname()[1]), self.token],
+                                     stdout=out, stderr=out, creationflags=0x08000000)  # CREATE_NO_WINDOW
+        threading.Thread(target=self._serve, args=(srv,), daemon=True).start()
+
+    def _serve(self, srv):
+        srv.settimeout(1.0)
+        deadline = time.time() + 90  # first run unpacks the Flet client, later starts take ~3-5 s
+        conn = None
+        while conn is None:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                if self.proc.poll() is not None or time.time() > deadline:
+                    srv.close()
+                    self.events.put((self.channel + "_failed", f"exit code {self.proc.poll()}"))
+                    return
+        srv.close()
+        f = conn.makefile("r", encoding="utf-8")
+        try:
+            hello = json.loads(f.readline() or "{}")
+        except ValueError:
+            hello = {}
+        if hello.get("token") != self.token:
+            conn.close()
+            self.events.put((self.channel + "_failed", "bad handshake"))
+            return
+        self.size = (hello.get("width", 460), hello.get("height", 640))
+        self.conn = conn
+        self.events.put((self.channel, {"type": "ready"}))
+        try:
+            for line in f:
+                self.events.put((self.channel, json.loads(line)))
+        except (OSError, ValueError):
+            pass
+        self.conn = None
+        self.events.put((self.channel, {"type": "gone"}))
+
+    def send(self, **msg):
+        conn = self.conn
+        if not conn:
+            return
+        try:
+            with self.lock:
+                conn.sendall((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+
+    def return_focus(self):
+        """Flet activates its (still hidden) window on start-up, which would swallow the user's typing.
+        Hand the foreground back to whatever had it; the Alt tap lifts Windows' foreground lock."""
+        hwnd = ua.user32.GetForegroundWindow()
+        title = ctypes.create_unicode_buffer(64)
+        ua.user32.InternalGetWindowText(hwnd, title, 64)
+        if title.value == self.title and self.prev_foreground and ua.user32.IsWindow(self.prev_foreground):
+            ua.user32.keybd_event(0x12, 0, 0, 0)
+            ua.user32.keybd_event(0x12, 0, 2, 0)
+            ua.user32.SetForegroundWindow(self.prev_foreground)
+
+    def close(self):
+        self.send(type="quit")
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+class SettingsPanel:
+    """The Flet settings window (kitsu_settings_ui.py). It edits the running app through the same variables
+    and handlers as the classic Tk control center, which stays as the fallback."""
+
+    TOGGLES = {"enabled": "var_enabled", "auto": "var_auto", "animate": "var_anim_type", "auto_write": "var_auto_write"}
+
+    def __init__(self, npc):
+        self.npc, self.app = npc, npc.app
+        self.win = None
+        self.ready = False
+        self.visible = False
+        self.want_show = False
+        self.last_status = None
+
+    def open(self):
+        if self.win is None:
+            if not importlib.util.find_spec("flet"):
+                self.npc.show_classic_control_center()
+                return
+            self.win = FletChat(self.npc.events, "kitsu_settings_ui.py", "settings_ui", "Kitsu Settings")
+        self.want_show = True
+        if self.ready:
+            self._show()
+
+    def _show(self):
+        self.want_show = False
+        self.win.send(type="state", **self.state())
+        self.push_status(force=True)
+        wl, wt, wr, wb = ua.get_work_area(int(self.npc.x), int(self.npc.y))
+        w, h = self.win.size
+        ua.user32.AllowSetForegroundWindow(-1)  # we just got the user's click: let the window take focus
+        self.win.send(type="show", x=int(wl + (wr - wl - w) / 2), y=int(max(wt, wt + (wb - wt - h) / 2)))
+        self.visible = True
+
+    def hide(self):
+        if self.win:
+            self.win.send(type="hide")
+        self.visible = False
+        self.npc.settings_public = False
+
+    def close(self):
+        if self.win:
+            self.win.close()
+
+    def state(self) -> dict:
+        app = self.app
+        return {
+            **{k: bool(getattr(app, v).get()) for k, v in self.TOGGLES.items()},
+            "speed": int(app.typing_delay_ms),
+            "providers": [p["label"] for p in ua.PROVIDERS.values()],
+            "provider": app.var_provider.get(),
+            **self.fields(),
+        }
+
+    def fields(self) -> dict:
+        app = self.app
+        return {"model": app.var_model.get(), "base_url": app.var_base_url.get(), "api_key": app.var_api_key.get()}
+
+    def push_status(self, force: bool = False):
+        """Mirrors the control center's live labels (active app, speed, buffer, provider test result)."""
+        app = self.app
+        status = {
+            "app": app.lbl_app.cget("text"), "stats": app.lbl_stats.cget("text"), "warn": app.lbl_warn.cget("text"),
+            "buf": app.lbl_buf.cget("text"), "provider_status": app.lbl_provider_status.cget("text"),
+            "enabled": bool(app.var_enabled.get()),
+        }
+        if force or status != self.last_status:
+            self.last_status = status
+            self.win.send(type="status", **status)
+
+    def on_message(self, msg: dict):
+        app, kind = self.app, msg.get("type")
+        if kind == "ready":
+            self.ready = True
+            self.win.return_focus()
+            if self.want_show:
+                self._show()
+        elif kind == "set":
+            key, value = msg.get("key"), msg.get("value")
+            if key in self.TOGGLES:
+                getattr(app, self.TOGGLES[key]).set(bool(value))
+                app.on_toggle_settings()
+            elif key == "speed":
+                app.speed_scale.set(int(value))
+                app.on_speed_change(value)
+        elif kind == "provider":  # picking a provider fills in its saved model / URL / key
+            app.var_provider.set(msg.get("label", ""))
+            app.on_provider_selected(msg.get("label", ""))
+            self.win.send(type="fields", **self.fields())
+        elif kind == "apply":
+            app.var_provider.set(msg.get("label") or app.var_provider.get())
+            app.var_model.set(msg.get("model") or "")
+            app.var_base_url.set(msg.get("base_url") or "")
+            app.var_api_key.set(msg.get("api_key") or "")
+            app.apply_provider()  # saves ua_config.json and tests the connection (result shows in the status)
+            self.npc.set_provider_label(ua.provider_label(app.config))
+        elif kind == "demo":  # the window put a function header in its test box and focused it
+            app.root.after(250, self.run_demo)
+        elif kind == "focus":
+            # Typing in the test box goes through autocomplete like any app; everywhere else (API key!) it doesn't
+            self.npc.settings_public = msg.get("field") == "test"
+        elif kind == "close":
+            self.hide()
+        elif kind == "gone":
+            self.win, self.ready, self.visible = None, False, False
+
+    def run_demo(self):
+        app = self.app
+        app.current_suggestion = "return 3.14159 * (radius ** 2)"
+        app.suggestion_backspaces = 0
+        app.suggestion_visible = True
+        app.trigger_accept_and_write()
 
 
 def attach(app):
@@ -79,14 +301,18 @@ def attach(app):
     the control center is hidden (Kitsu's menu reopens it), and the chat box is reported to the keyboard hook
     as an app in skip_apps so nothing typed there (API keys included) is sent for completion."""
     original_info = ua.get_active_window_info
+    holder = {}
 
     def window_info():
         info = original_info()
-        return (info[0], PRIVATE_APP, info[2], info[3]) if info[0] in PRIVATE_HWNDS else info
+        hwnd, proc, title = info[0], info[1].lower(), normalize_title(info[2])
+        private = hwnd in PRIVATE_HWNDS or (proc == FLET_APP and (
+            title == "Kitsu Chat" or (title == "Kitsu Settings" and not getattr(holder.get("npc"), "settings_public", False))))
+        return (hwnd, PRIVATE_APP, info[2], info[3]) if private else info
 
     ua.get_active_window_info = window_info
     app.skip_apps = set(app.skip_apps) | {PRIVATE_APP}
-    npc = NpcCompanion(app)
+    npc = holder["npc"] = NpcCompanion(app)
     app.root.withdraw()
     app.root.protocol("WM_DELETE_WINDOW", app.root.withdraw)
     return npc
@@ -185,6 +411,13 @@ class NpcCompanion:
         self.history = []
         self.pending_key = None  # a pasted key waiting for "which provider?"
         self.busy = False
+        self.harness_run = None      # running coding-agent task
+        self.pending_harness = None  # (name, task) waiting for "allow file edits?"
+        self.harness_lines = 0
+        self.last_answer = ""
+        self.ui = None               # FletChat once its window is up; until then (or without Flet) the Tk chat
+        self.ui_actions = {}         # quick-action button id -> callback, for the Flet window
+        self.transcript = []         # (who, text) so far, replayed into the Flet window when it connects
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
@@ -201,6 +434,14 @@ class NpcCompanion:
         self.menu.add_command(label="❌ ออกจากโปรแกรม", command=app.root.destroy)
 
         self.build_chat()
+        self.flet = None
+        self.settings = SettingsPanel(self)
+        self.settings_public = False  # the settings window's test box has focus: let autocomplete see it
+        if self.app.config.get("chat_ui", "flet") == "flet" and importlib.util.find_spec("flet"):
+            try:
+                self.flet = FletChat(self.events)
+            except OSError as e:
+                print(f"[kitsu] Flet chat unavailable ({e}); using the Tk chat")
         self.place()
         self.win.after(TICK_MS, self.tick)
         greeting = "สวัสดี! ผม Kitsu เอง 🦊 คลิกที่ผมเพื่อคุยกันได้นะ"
@@ -212,6 +453,12 @@ class NpcCompanion:
     # ------------------------------------------------------------------ app integration
 
     def show_control_center(self):
+        if self.app.config.get("chat_ui", "flet") == "flet":
+            self.settings.open()
+        else:
+            self.show_classic_control_center()
+
+    def show_classic_control_center(self):
         root = self.app.root
         root.deiconify()
         root.lift()
@@ -236,7 +483,7 @@ class NpcCompanion:
 
     def place(self):
         self.win.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
-        if self.chat.winfo_viewable():
+        if not self.ui and self.chat.winfo_viewable():  # the Flet window stays where it was opened / dragged
             self.place_chat()
 
     def play(self, *steps):
@@ -286,7 +533,7 @@ class NpcCompanion:
         now = time.perf_counter()
         self.tick_n += 1
         self.drain_events()
-        chatting = self.chat.winfo_viewable() or now < self.talk_until or self.thinking
+        chatting = self.chat_visible() or now < self.talk_until or self.thinking
 
         if self.seq and now >= self.seq_end:
             self.seq.pop(0)
@@ -329,6 +576,8 @@ class NpcCompanion:
             bob = -round(1 + math.sin(now * 2.6))
         self.canvas.coords(self.sprite, 0, bob)
         self.canvas.itemconfig(self.sprite, image=self.frames[self.frame_name(now)])
+        if self.settings.visible and self.tick_n % 15 == 0:  # ~0.6 s: live status in the settings window
+            self.settings.push_status()
         if self.tick_n % 125 == 0:  # ~5 s: stay above windows that grabbed topmost after us
             self.win.attributes("-topmost", True)
         self.win.after(TICK_MS, self.tick)
@@ -444,21 +693,44 @@ class NpcCompanion:
         close.pack(side=tk.RIGHT)
         close.bind("<Button-1>", lambda _e: self.close_chat())
 
-        self.log = tk.Text(frame, width=44, height=11, wrap="word", font=("Segoe UI", 10), bg=panel, fg=fg,
-                           relief=tk.FLAT, padx=8, pady=6, state=tk.DISABLED, cursor="arrow")
+        self.log = tk.Text(frame, width=52, height=15, wrap="word", font=("Segoe UI", 10), bg=bg, fg=fg,
+                           relief=tk.FLAT, padx=4, pady=6, state=tk.DISABLED, cursor="arrow",
+                           spacing1=1, spacing2=3, spacing3=1, highlightthickness=0)
         self.log.pack(fill=tk.BOTH, expand=True, pady=(6, 6))
-        self.log.tag_configure("npc", foreground="#7dd3fc")
-        self.log.tag_configure("me", foreground="#fde68a", justify="right")
-        self.log.tag_configure("sys", foreground="#94a3b8", font=("Segoe UI", 9, "italic"))
+        # Message blocks: a small name line, then the text on a tinted card (tag background + margins)
+        self.log.tag_configure("npc_head", foreground=accent, font=("Segoe UI", 9, "bold"), spacing1=10, lmargin1=6)
+        self.log.tag_configure("npc_body", foreground=fg, background="#1c2a42", lmargin1=6, lmargin2=6, rmargin=34,
+                               spacing1=2, spacing3=2, lmargincolor=bg, rmargincolor=bg)
+        self.log.tag_configure("me_head", foreground="#fcd34d", font=("Segoe UI", 9, "bold"), spacing1=10,
+                               justify="right", rmargin=6)
+        self.log.tag_configure("me_body", foreground="#fef3c7", background="#3a321c", lmargin1=70, lmargin2=70,
+                               rmargin=6, spacing1=2, spacing3=2, lmargincolor=bg, rmargincolor=bg)
+        self.log.tag_configure("sys", foreground="#94a3b8", font=("Segoe UI", 8, "italic"), lmargin1=10, lmargin2=10,
+                               spacing1=4)
+        self.log.tag_configure("code", font=("Consolas", 9), foreground="#a5f3fc", background="#0b1220")
+        self.log.tag_configure("codeblock", font=("Consolas", 9), foreground="#e2e8f0", background="#0b1220",
+                               lmargin1=14, lmargin2=14, rmargin=34, spacing1=0, spacing3=0)
+        self.log.tag_configure("bold", font=("Segoe UI", 10, "bold"))
+        for t in ("code", "bold", "codeblock"):
+            self.log.tag_raise(t)
 
         self.quick = tk.Frame(frame, bg=bg)
         self.quick.pack(fill=tk.X)
 
-        row = tk.Frame(frame, bg=bg)
+        # Command suggestions (shown above the input while typing "/...", "/cd <path>", "ใช้ <provider>")
+        self.sugg_frame = tk.Frame(frame, bg="#0b1220", highlightthickness=1, highlightbackground="#334155")
+        self.sugg_items, self.sugg_index = [], 0
+
+        row = self.entry_row = tk.Frame(frame, bg=bg)
         row.pack(fill=tk.X, pady=(6, 0))
         self.entry = tk.Entry(row, font=("Segoe UI", 10), bg=panel, fg=fg, insertbackground=fg, relief=tk.FLAT)
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-        self.entry.bind("<Return>", lambda _e: self.send())
+        self.entry.bind("<Return>", self.on_return)
+        self.entry.bind("<Tab>", lambda _e: self.accept_suggestion() or "break")
+        self.entry.bind("<Down>", lambda _e: self.move_suggestion(1) or "break")
+        self.entry.bind("<Up>", lambda _e: self.move_suggestion(-1) or "break")
+        self.entry.bind("<Escape>", self.on_entry_escape)
+        self.entry.bind("<KeyRelease>", self.on_entry_key)
         tk.Button(row, text="ส่ง", command=self.send, font=("Segoe UI", 9, "bold"), bg=accent, fg=bg,
                   relief=tk.FLAT, padx=12, cursor="hand2").pack(side=tk.LEFT, padx=(6, 0))
 
@@ -467,46 +739,273 @@ class NpcCompanion:
         PRIVATE_HWNDS.add(ua.user32.GetParent(self.chat.winfo_id()) or self.chat.winfo_id())
         self.show_quick_actions()
 
-    def place_chat(self):
-        self.chat.update_idletasks()
-        cw, ch = self.chat.winfo_reqwidth(), self.chat.winfo_reqheight()
+    def chat_position(self, cw: int, ch: int):
+        """Top-left for a cw x ch chat window: above Kitsu, kept on Kitsu's monitor."""
         wl, wt, wr, wb = ua.get_work_area(int(self.x), int(self.y))
         x = int(self.x + self.w / 2 - cw / 2)
         y = int(self.ground_y() - ch - 6)
         if y < wt:
             y = int(self.ground_y() + self.h + 6)
-        x = max(wl + 4, min(x, wr - cw - 4))
-        self.chat.geometry(f"+{x}+{max(wt, y)}")
+        return max(wl + 4, min(x, wr - cw - 4)), max(wt, y)
+
+    def place_chat(self):
+        self.chat.update_idletasks()
+        x, y = self.chat_position(self.chat.winfo_reqwidth(), self.chat.winfo_reqheight())
+        self.chat.geometry(f"+{x}+{y}")
+
+    def chat_visible(self) -> bool:
+        return self.ui.visible if self.ui else bool(self.chat.winfo_viewable())
+
+    def set_provider_label(self, text: str):
+        self.lbl_provider.config(text=text)
+        if self.ui:
+            self.ui.send(type="provider", label=text)
 
     def open_chat(self):
-        if not self.chat.winfo_viewable():
-            self.lbl_provider.config(text=ua.provider_label(self.app.config))
-            self.chat.deiconify()
-            self.place_chat()
+        if not self.chat_visible():
+            self.set_provider_label(ua.provider_label(self.app.config))
+            if self.ui:
+                # The window's DPI scale is unknown here; size is in logical px, close enough for placement
+                x, y = self.chat_position(*self.ui.size)
+                # We just got the user's click, so Windows lets us pass the right to take focus on to the window
+                ua.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+                self.ui.send(type="show", x=x, y=y)
+                self.ui.visible = True
+            else:
+                self.chat.deiconify()
+                self.place_chat()
             self.touched()
             if not self.seq:
                 self.play(("wave", 0.8))
         self.state = "idle"
         self.facing = "right"
-        self.chat.lift()
-        self.chat.focus_force()
-        self.entry.focus_set()
+        if not self.ui:
+            self.chat.lift()
+            self.chat.focus_force()
+            self.entry.focus_set()
 
     def close_chat(self):
-        self.chat.withdraw()
+        if self.ui:
+            self.ui.send(type="hide")
+            self.ui.visible = False
+        else:
+            self.chat.withdraw()
 
     def toggle_chat(self):
-        if self.chat.winfo_viewable():
+        if self.chat_visible():
             self.close_chat()
         else:
             self.open_chat()
 
     def append(self, who: str, text: str):
+        self.transcript = (self.transcript + [(who, text)])[-200:]
+        if self.ui:
+            if who == "sys" and text == "…กำลังคิด":
+                self.ui.send(type="thinking", on=True)
+            else:
+                self.ui.send(type="append", who=who, text=text)
+            return
         self.log.config(state=tk.NORMAL)
-        prefix = {"npc": f"{NAME}: ", "me": "", "sys": ""}[who]
-        self.log.insert(tk.END, f"{prefix}{text}\n", who)
+        if who == "sys":
+            self.log.insert(tk.END, f"{text}\n", "sys")
+        else:
+            self.log.insert(tk.END, (f"🦊 {NAME}" if who == "npc" else "คุณ") + "\n", f"{who}_head")
+            self.insert_rich(text, f"{who}_body")
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
+
+    def insert_rich(self, text: str, base: str):
+        """Light markdown: ```code blocks```, `inline code`, **bold**, and '- ' bullets."""
+        for part in re.split(r"(```[\s\S]*?```)", text.strip()):
+            if not part:
+                continue
+            if part.startswith("```"):
+                code = re.sub(r"^```[\w+-]*\n?|```$", "", part).strip("\n")
+                self.log.insert(tk.END, code + "\n", (base, "codeblock"))
+                continue
+            lines = [re.sub(r"^(\s*)[-*] ", r"\1• ", ln) for ln in part.strip("\n").split("\n")]
+            for piece in re.split(r"(`[^`\n]+`|\*\*[^*\n]+\*\*)", "\n".join(lines)):
+                if piece.startswith("`") and piece.endswith("`") and len(piece) > 2:
+                    self.log.insert(tk.END, piece[1:-1], (base, "code"))
+                elif piece.startswith("**") and piece.endswith("**") and len(piece) > 4:
+                    self.log.insert(tk.END, piece[2:-2], (base, "bold"))
+                elif piece:
+                    self.log.insert(tk.END, piece, base)
+            self.log.insert(tk.END, "\n", base)
+
+    # ------------------------------------------------------------------ input suggestions
+
+    COMMANDS = [
+        ("/claude ", "ถาม Claude Code (อ่านอย่างเดียว)"), ("/claude+ ", "ให้ Claude Code แก้ไฟล์ได้"),
+        ("/codex ", "ถาม Codex (อ่านอย่างเดียว)"), ("/codex+ ", "ให้ Codex แก้ไฟล์ได้"),
+        ("/opencode ", "ถาม OpenCode (อ่านอย่างเดียว)"), ("/opencode+ ", "ให้ OpenCode แก้ไฟล์ได้"),
+        ("/cd ", "เปลี่ยนโฟลเดอร์ทำงานของ agent"), ("/stop", "หยุดงานที่กำลังรัน"),
+        ("/harness", "ดู agent ที่มีในเครื่อง"), ("/help", "วิธีใช้คำสั่ง"),
+    ]
+
+    def suggestions_for(self, text: str) -> list:
+        """[(value to insert, description)] for what's typed so far."""
+        if text.lower().startswith("/cd "):
+            return self.path_suggestions(text[4:])
+        if text.startswith("/") and " " not in text:
+            if not hasattr(self, "_installed"):
+                self._installed = set(harness_mod.available())
+            out = []
+            for value, desc in self.COMMANDS:
+                agent = value.strip("/+ ")
+                if agent in harness_mod.HARNESSES and agent not in self._installed:
+                    continue
+                if value.lower().startswith(text.lower()) and value.strip() != text:
+                    out.append((value, desc))
+            return out
+        m = re.match(r"^(ใช้|เปลี่ยนเป็น|เปลี่ยนไปใช้|สลับเป็น|use|switch to)\s+(\S*)$", text, re.I)
+        if m:
+            return [(f"{m.group(1)} {name}", p["label"]) for name, p in ua.PROVIDERS.items()
+                    if name.startswith(m.group(2).lower()) and name != m.group(2).lower()]
+        m = re.match(r"^(ให้|ถาม)\s*(\S*)$", text)
+        if m:
+            if not hasattr(self, "_installed"):
+                self._installed = set(harness_mod.available())
+            return [(f"{m.group(1)} {n} ", f"ส่งงานให้ {harness_mod.HARNESSES[n]['label']} (อ่านอย่างเดียว)")
+                    for n in harness_mod.HARNESSES if n in self._installed and n.startswith(m.group(2).lower())
+                    and n != m.group(2).lower()]
+        return []
+
+    def path_suggestions(self, typed: str) -> list:
+        typed = typed.strip('"')
+        base = os.path.expandvars(os.path.expanduser(typed)) if typed else self.harness_settings()[0] + os.sep
+        folder, prefix = os.path.split(base)
+        try:
+            names = sorted(e.name for e in os.scandir(folder or ".") if e.is_dir() and not e.name.startswith((".", "$")))
+        except OSError:
+            return []
+        hits = [n for n in names if n.lower().startswith(prefix.lower())][:8]
+        return [(f"/cd {os.path.normpath(os.path.join(folder, n))}{os.sep}", "📁 โฟลเดอร์") for n in hits]
+
+    def input_text(self) -> str:
+        return self.ui.text if self.ui else self.entry.get()
+
+    def set_input_text(self, text: str):
+        if self.ui:
+            self.ui.text = text
+            self.ui.send(type="entry", text=text)
+        else:
+            self.entry.delete(0, tk.END)
+            self.entry.insert(0, text)
+            self.entry.icursor(tk.END)
+            self.entry.focus_set()
+
+    def refresh_suggestions(self):
+        dismissed = getattr(self, "sugg_dismissed", False)
+        self.sugg_items = [] if dismissed else self.suggestions_for(self.input_text())[:10]
+        self.sugg_index = min(self.sugg_index, max(0, len(self.sugg_items) - 1))
+        if self.ui:
+            self.ui.send(type="suggestions", items=self.sugg_items, index=self.sugg_index)
+            return
+        for w in self.sugg_frame.winfo_children():
+            w.destroy()
+        if not self.sugg_items:
+            self.sugg_frame.pack_forget()
+            return
+        for i, (value, desc) in enumerate(self.sugg_items):
+            sel = i == self.sugg_index
+            rowbg = "#1e3a5f" if sel else "#0b1220"
+            r = tk.Frame(self.sugg_frame, bg=rowbg, cursor="hand2")
+            r.pack(fill=tk.X)
+            shown = value[4:] if desc.startswith("📁") else value.strip()
+            for w in (tk.Label(r, text=shown, font=("Consolas", 9, "bold"), fg="#7dd3fc" if sel else "#cbd5e1",
+                               bg=rowbg, anchor="w", padx=6),
+                      tk.Label(r, text=desc, font=("Segoe UI", 8), fg="#94a3b8", bg=rowbg, anchor="e", padx=6)):
+                w.pack(side=tk.LEFT if w.cget("anchor") == "w" else tk.RIGHT)
+                w.bind("<Button-1>", lambda _e, k=i: (setattr(self, "sugg_index", k), self.accept_suggestion()))
+        if not self.sugg_frame.winfo_ismapped():
+            self.sugg_frame.pack(fill=tk.X, pady=(6, 0), before=self.entry_row)
+        if self.chat.winfo_viewable():
+            self.place_chat()
+
+    def on_entry_key(self, e):
+        if e.keysym not in ("Up", "Down", "Tab", "Return", "Escape"):
+            self.sugg_index = 0
+            self.sugg_dismissed = False
+            self.refresh_suggestions()
+
+    def move_suggestion(self, step: int):
+        if self.sugg_items:
+            self.sugg_index = (self.sugg_index + step) % len(self.sugg_items)
+            self.refresh_suggestions()
+
+    def accept_suggestion(self) -> bool:
+        if not self.sugg_items:
+            return False
+        value = self.sugg_items[self.sugg_index][0]
+        self.set_input_text(value)
+        self.sugg_index = 0
+        self.refresh_suggestions()  # e.g. keep drilling into folders after "/cd "
+        return True
+
+    def on_return(self, _e):
+        if not self.accept_suggestion():
+            self.send()
+        return "break"
+
+    def on_entry_escape(self, _e):
+        if self.sugg_items:
+            self.sugg_dismissed = True
+            self.refresh_suggestions()
+            return "break"
+        self.close_chat()
+        return "break"
+
+    def on_ui_message(self, msg: dict):
+        """Events from the Flet chat window (see kitsu_chat_ui.py)."""
+        kind = msg.get("type")
+        if kind == "ready":
+            self.ui = self.flet
+            self.ui.return_focus()
+            if self.chat.winfo_viewable():  # the Tk chat was standing in while Flet started: swap it out
+                self.chat.withdraw()
+                self.open_chat()
+            for who, text in self.transcript:
+                if not (who == "sys" and text == "…กำลังคิด"):
+                    self.ui.send(type="append", who=who, text=text)
+            self.ui.send(type="thinking", on=self.thinking)
+            self.set_provider_label(ua.provider_label(self.app.config))
+            self.show_quick_actions()
+        elif not self.ui:
+            return
+        elif kind == "typed":
+            self.ui.text = msg.get("text", "")
+            self.sugg_index = 0
+            self.sugg_dismissed = False
+            self.refresh_suggestions()
+        elif kind == "submit":
+            self.ui.text = msg.get("text", "")
+            if not self.accept_suggestion():
+                self.send(self.ui.text)
+        elif kind == "key":
+            key = msg.get("key")
+            if key in ("up", "down"):
+                self.move_suggestion(-1 if key == "up" else 1)
+            elif key == "tab":
+                self.accept_suggestion()
+            elif key == "escape":
+                self.on_entry_escape(None)
+        elif kind == "pick":
+            self.sugg_index = int(msg.get("index", 0))
+            self.accept_suggestion()
+        elif kind == "button":
+            action = self.ui_actions.get(msg.get("id"))
+            if action:
+                action()
+        elif kind == "close":
+            self.close_chat()
+        elif kind == "gone":  # the window died: fall back to the Tk chat
+            self.ui = self.flet = None
+
+    def shutdown(self):
+        if self.flet:
+            self.flet.close()
+        self.settings.close()
 
     def say(self, text: str, open_panel: bool = True):
         """Kitsu talks: mouth animation for roughly as long as the line takes to read."""
@@ -525,7 +1024,8 @@ class NpcCompanion:
         tip.withdraw()
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
-        tk.Label(tip, text=text, font=("Segoe UI", 10), bg="#f8fafc", fg="#0f172a", wraplength=260,
+        plain = re.sub(r"`|\*\*|```", "", text)
+        tk.Label(tip, text=plain if len(plain) <= 160 else plain[:160] + "…", font=("Segoe UI", 10), bg="#f8fafc", fg="#0f172a", wraplength=260,
                  justify="left", padx=10, pady=6, relief=tk.SOLID, bd=1).pack()
         tip.update_idletasks()
         hwnd = ua.user32.GetParent(tip.winfo_id()) or tip.winfo_id()
@@ -537,21 +1037,44 @@ class NpcCompanion:
         tx = max(wl + 4, min(int(self.x + self.w / 2 - tw / 2), wr - tw - 4))
         tip.geometry(f"+{tx}+{max(wt, int(self.y - th - 4))}")
         tip.bind("<Button-1>", lambda _e: (tip.destroy(), self.open_chat()))
-        tip.after(int(2500 + len(text) * 60), tip.destroy)
+        tip.after(min(12000, int(2500 + len(text) * 60)), tip.destroy)
 
     def show_quick_actions(self, providers=None):
+        """The button row under the chat: [(label, callback or None for a plain label, tone)]."""
+        if providers:  # "which provider is this key for?"
+            specs = [("key นี้ของ:", None, "label")] + [
+                (name, lambda n=name: self.store_pending_key(n), "warn") for name in providers]
+        elif self.pending_harness:  # "allow the agent to edit files?"
+            specs = [("✅ อนุญาตให้แก้ไฟล์", lambda: self.confirm_harness(True), "ok"),
+                     ("✖ ยกเลิก", lambda: self.confirm_harness(False), "danger")]
+        else:
+            specs = [("🔑 ใส่ API key", self.ask_for_key, "default"), ("🔌 provider", self.list_providers, "default"),
+                     ("🛠 Harness", self.harness_help, "default"), ("⚙️ ตั้งค่า", self.show_control_center, "default")]
+            if self.last_answer:
+                specs.insert(0, ("📋 คัดลอกคำตอบ", self.copy_answer, "default"))
+
+        if self.ui:
+            self.ui_actions = {}
+            buttons = []
+            for i, (label, cb, tone) in enumerate(specs):
+                if cb is None:
+                    buttons.append({"kind": "label", "label": label})
+                else:
+                    self.ui_actions[str(i)] = cb
+                    buttons.append({"id": str(i), "label": label, "tone": tone})
+            self.ui.send(type="quick", buttons=buttons)
+
         for w in self.quick.winfo_children():
             w.destroy()
         style = {"font": ("Segoe UI", 8, "bold"), "relief": tk.FLAT, "cursor": "hand2", "padx": 6}
-        if providers:  # "which provider is this key for?"
-            tk.Label(self.quick, text="key นี้ของ:", font=("Segoe UI", 8), fg="#94a3b8", bg="#0f172a").pack(side=tk.LEFT)
-            for name in providers:
-                tk.Button(self.quick, text=name, bg="#fbbf24", fg="#0f172a",
-                          command=lambda n=name: self.store_pending_key(n), **style).pack(side=tk.LEFT, padx=2)
-            return
-        for label, cmd in (("🔑 ใส่ API key", self.ask_for_key), ("🔌 เปลี่ยน provider", self.list_providers),
-                           ("⚙️ ตั้งค่า", self.show_control_center)):
-            tk.Button(self.quick, text=label, bg="#334155", fg="#e2e8f0", command=cmd, **style).pack(side=tk.LEFT, padx=2)
+        colors = {"default": ("#334155", "#e2e8f0"), "warn": ("#fbbf24", "#0f172a"), "ok": ("#34d399", "#0f172a"),
+                  "danger": ("#f87171", "#0f172a")}
+        for label, cb, tone in specs:
+            if cb is None:
+                tk.Label(self.quick, text=label, font=("Segoe UI", 8), fg="#94a3b8", bg="#0f172a").pack(side=tk.LEFT)
+            else:
+                bg, fg = colors[tone]
+                tk.Button(self.quick, text=label, bg=bg, fg=fg, command=cb, **style).pack(side=tk.LEFT, padx=2)
 
     def ask_for_key(self):
         self.open_chat()
@@ -564,11 +1087,13 @@ class NpcCompanion:
 
     # ------------------------------------------------------------------ conversation logic
 
-    def send(self):
-        text = self.entry.get().strip()
-        if not text or self.busy:
+    def send(self, text: str = None):
+        text = (self.input_text() if text is None else text).strip()
+        if not text or (self.busy and text.lower() != "/stop"):
             return
-        self.entry.delete(0, tk.END)
+        self.set_input_text("")
+        self.sugg_dismissed = False
+        self.refresh_suggestions()
 
         m = KEY_RE.search(text)
         if m:  # API key: handled entirely here, never logged in full or sent to the model
@@ -578,6 +1103,8 @@ class NpcCompanion:
             return
 
         self.append("me", text)
+        if self.handle_harness_command(text):
+            return
         sw = SWITCH_RE.search(text)
         target = provider_in_text(sw.group(1)) if sw else None
         if target:
@@ -587,6 +1114,98 @@ class NpcCompanion:
             self.test_connection()
             return
         self.ask_model(text)
+
+    # ------------------------------------------------------------------ coding agents (harness.py)
+
+    def harness_settings(self):
+        h = ua.load_raw_config().get("harness", {})
+        return h.get("cwd") or os.path.expanduser("~"), h.get("models", {})
+
+    def harness_help(self):
+        self.open_chat()
+        found = harness_mod.available()
+        names = ", ".join(harness_mod.HARNESSES[n]["label"] for n in found) or "ไม่พบเลย"
+        cwd, _ = self.harness_settings()
+        self.say(f"ผมสั่ง AI agent ในเครื่องให้ได้ครับ\n"
+                 f"**พบ:** {names}\n"
+                 f"**โฟลเดอร์ทำงาน:** `{cwd}`\n\n"
+                 "- `/claude <งาน>` หรือ `ให้ claude …` — อ่าน/ตอบอย่างเดียว\n"
+                 "- `/claude+ <งาน>` — ให้แก้ไฟล์ได้ (ถามยืนยันก่อน)\n"
+                 "- `/codex`, `/opencode` — ใช้แบบเดียวกัน\n"
+                 "- `/cd <โฟลเดอร์>` — เปลี่ยนที่ทำงาน\n"
+                 "- `/stop` — หยุดงาน\n\n"
+                 "พิมพ์ `/` แล้วจะมีรายการคำสั่งให้เลือก (↑↓ แล้วกด Tab)")
+
+    def handle_harness_command(self, text: str) -> bool:
+        low = text.lower()
+        if low == "/stop":
+            if self.harness_run:
+                self.harness_run.cancel()
+                self.append("sys", "…กำลังหยุด")
+            else:
+                self.say("ตอนนี้ไม่มีงานที่รันอยู่ครับ")
+            return True
+        if low in ("/harness", "/help"):
+            self.harness_help()
+            return True
+        if low.startswith("/cd"):
+            path = os.path.expandvars(os.path.expanduser(text[3:].strip().strip('"')))
+            if not path or not os.path.isdir(path):
+                self.say(f"ไม่เจอโฟลเดอร์นี้ครับ: {path or '(ว่าง)'}")
+                return True
+            raw = ua.load_raw_config()
+            raw.setdefault("harness", {})["cwd"] = os.path.abspath(path)
+            _write_config(raw)
+            self.say(f"📁 ต่อไป agent จะทำงานใน {os.path.abspath(path)}")
+            return True
+        m = HARNESS_CMD_RE.match(text)
+        if m:
+            name, edit, task = m.group(1).lower(), bool(m.group(2)), m.group(3).strip()
+        else:
+            m = HARNESS_NL_RE.match(text)
+            if not m:
+                return False
+            name, edit, task = m.group(1).lower(), False, m.group(2).strip()
+        if name not in harness_mod.available():
+            self.play(("shrug", 1.0))
+            self.say(f"ไม่พบ {harness_mod.HARNESSES[name]['label']} ในเครื่องนี้ครับ")
+            return True
+        if edit:
+            cwd, _ = self.harness_settings()
+            self.pending_harness = (name, task)
+            self.show_quick_actions()
+            self.play(("think", 1.0))
+            self.say(f"⚠️ {harness_mod.HARNESSES[name]['label']} จะแก้ไฟล์ใน {cwd} ได้ — อนุญาตไหมครับ?")
+            return True
+        self.start_harness(name, task, "ask")
+        return True
+
+    def confirm_harness(self, allow: bool):
+        pending, self.pending_harness = self.pending_harness, None
+        self.show_quick_actions()
+        if pending and allow:
+            self.start_harness(*pending, "edit")
+        elif pending:
+            self.say("ยกเลิกแล้วครับ ไม่มีไฟล์ไหนถูกแก้")
+
+    def start_harness(self, name: str, task: str, mode: str):
+        cwd, models = self.harness_settings()
+        label = harness_mod.HARNESSES[name]["label"]
+        self.busy = self.thinking = True
+        self.harness_lines = 0
+        self.touched()
+        self.append("sys", f"🛠 {label} · {'แก้ไฟล์ได้' if mode == 'edit' else 'อ่านอย่างเดียว'} · {cwd}  "
+                           f"(พิมพ์ /stop เพื่อหยุด)")
+        self.harness_run = harness_mod.HarnessRun(
+            name, task, cwd, mode, model=models.get(name),
+            on_line=lambda line: self.events.put(("harness_line", (name, line))),
+            on_done=lambda ok, answer, secs: self.events.put(("harness_done", (name, ok, answer, secs))),
+        ).start()
+
+    def copy_answer(self):
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(self.last_answer)
+        self.append("sys", "📋 คัดลอกคำตอบแล้ว")
 
     def handle_key(self, key: str, text: str):
         provider = provider_in_text(text.replace(key, ""))
@@ -614,7 +1233,7 @@ class NpcCompanion:
 
     def test_connection(self):
         cfg = dict(self.app.config)
-        self.lbl_provider.config(text=ua.provider_label(cfg))
+        self.set_provider_label(ua.provider_label(cfg))
 
         def work():
             try:
@@ -651,31 +1270,72 @@ class NpcCompanion:
         try:
             while True:
                 kind, data = self.events.get_nowait()
-                if kind == "reply":
+                if kind == "ui":
+                    self.on_ui_message(data)
+                elif kind == "ui_failed":
+                    print(f"[kitsu] Flet chat window didn't start ({data}); using the Tk chat")
+                    self.flet = None
+                elif kind == "settings_ui":
+                    self.settings.on_message(data)
+                elif kind == "settings_ui_failed":
+                    print(f"[kitsu] Flet settings window didn't start ({data}); using the classic one")
+                    self.settings.win = None
+                    if self.settings.want_show:
+                        self.show_classic_control_center()
+                elif kind == "reply":
                     self.busy = self.thinking = False
                     self.drop_thinking()
                     user, reply = data
                     self.history += [{"role": "user", "content": user}, {"role": "assistant", "content": reply}]
                     if LAUGH_RE.search(reply):
                         self.play(("laugh", 0.7))
-                    self.say(reply, open_panel=self.chat.winfo_viewable())
+                    self.say(reply, open_panel=self.chat_visible())
                 elif kind == "error":
                     self.busy = self.thinking = False
                     self.drop_thinking()
                     self.play(("surprised", 0.6), ("shrug", 1.0))
-                    self.say(data, open_panel=self.chat.winfo_viewable())
+                    self.say(data, open_panel=self.chat_visible())
                 elif kind == "celebrate":
                     self.hop("cheer")
-                    self.say(data, open_panel=self.chat.winfo_viewable())
+                    self.say(data, open_panel=self.chat_visible())
                 elif kind == "oops":
                     self.play(("surprised", 0.6), ("shrug", 1.0))
-                    self.say(data, open_panel=self.chat.winfo_viewable())
+                    self.say(data, open_panel=self.chat_visible())
+                elif kind == "harness_line":
+                    name, line = data
+                    # Agents that print only the final answer would show it twice; echo progress for the rest
+                    if harness_mod.HARNESSES[name].get("answer_file"):
+                        if self.harness_lines < HARNESS_SHOWN_LINES:
+                            self.append("sys", "│ " + line[:200])
+                        elif self.harness_lines == HARNESS_SHOWN_LINES:
+                            self.append("sys", "│ …")
+                    self.harness_lines += 1
+                elif kind == "harness_done":
+                    name, ok, answer, secs = data
+                    label = harness_mod.HARNESSES[name]["label"]
+                    self.busy = self.thinking = False
+                    self.harness_run = None
+                    if ok:
+                        self.last_answer = answer
+                        self.hop("cheer")
+                        shown = answer if len(answer) <= 3000 else answer[:3000] + "\n… (กด 📋 เพื่อคัดลอกทั้งหมด)"
+                        self.say(f"✅ {label} เสร็จแล้ว ({secs:.0f} วิ):\n{shown}", open_panel=self.chat_visible())
+                    else:
+                        self.play(("surprised", 0.6), ("shrug", 1.0))
+                        errors = [ln for ln in answer.splitlines() if "error" in ln.lower()]
+                        reason = errors[-1] if errors else answer[-600:]
+                        self.say(f"❌ {label}: {reason[:600]}", open_panel=self.chat_visible())
+                    self.show_quick_actions()
                 elif kind == "say":
-                    self.say(data, open_panel=self.chat.winfo_viewable())
+                    self.say(data, open_panel=self.chat_visible())
         except queue.Empty:
             pass
 
     def drop_thinking(self):
+        self.transcript = [m for m in self.transcript if m != ("sys", "…กำลังคิด")]
+        if self.ui:
+            self.ui.send(type="thinking", on=False)
+            return
         self.log.config(state=tk.NORMAL)
         idx = self.log.search("…กำลังคิด", "1.0", tk.END, backwards=True)
         if idx:
