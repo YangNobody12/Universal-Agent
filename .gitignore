@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Universal Autocomplete: local settings hold API keys
+ua_config*.json
+!ua_config.example.json

@@ -1,0 +1,15 @@
+# Universal Autocomplete — Windows 10/11, Python 3.9+ (64-bit) with Tcl/Tk
+# (python.org installer: tick "tcl/tk and IDLE")
+#
+#   pip install -r requirements.txt
+#
+# Official provider SDKs. They keep HTTP connections alive between requests (faster suggestions)
+# and give clearer API errors. Each one is optional: if it's missing, the app calls that API
+# with Python's built-in urllib instead.
+# Tested with openai 3.41.0, anthropic 2.3.0, ollama 0.6.3.
+openai>=3.0        # OpenAI-compatible: Typhoon, OpenAI, Gemini, OpenRouter, Groq, DeepSeek, Together, Mistral, LM Studio, llama.cpp, vLLM
+anthropic>=2.0     # Anthropic Claude
+ollama>=0.5        # Ollama (native API; 0.5+ can switch off thinking)
+
+# Tests (optional): pytest, or plain `python test_universal_autocomplete.py`
+pytest>=7.0
